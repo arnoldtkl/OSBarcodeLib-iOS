@@ -13,7 +13,7 @@ extension View {
             self.foregroundColor(colour)
         }
     }
-    
+
     /// Applies the given transform if the given condition evaluates to `true`.
     /// - Parameters:
     ///   - condition: The condition to evaluate.
@@ -27,7 +27,7 @@ extension View {
             self
         }
     }
-    
+
     /// Ignores safe area for different versions of iOS.
     /// - Returns: the View ignoring all safe areas.
     @ViewBuilder
@@ -38,7 +38,7 @@ extension View {
             self.edgesIgnoringSafeArea(.all)
         }
     }
-    
+
     /// Adds a modifier for this view that fires an action when a specific value changes.
     /// - Parameters:
     ///   - value: The value to check against when determining whether to run the closure.
@@ -46,7 +46,9 @@ extension View {
     /// - Returns: A view that fires an action when the specified value changes.
     @ViewBuilder
     func valueChanged<T: Equatable>(value: T, _ onChange: @escaping (T) -> Void) -> some View {
-        if #available(iOS 14.0, *) {
+        if #available(iOS 17.0, *) {
+            self.onChange(of: value) { _, newValue in onChange(newValue) }
+        } else if #available(iOS 14.0, *) {
             self.onChange(of: value, perform: onChange)
         } else {
             self.onReceive(Just(value)) { onChange($0) }
