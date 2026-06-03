@@ -16,3 +16,20 @@ extension AVCaptureVideoOrientation {
         }
     }
 }
+
+/// Extension that maps a `UIInterfaceOrientation` into a video rotation angle (degrees) for iOS 17+.
+@available(iOS 17.0, *)
+extension UIInterfaceOrientation {
+    /// The video rotation angle in degrees corresponding to this interface orientation.
+    /// Returns `nil` for unknown orientations.
+    var videoRotationAngle: CGFloat? {
+        switch self {
+        case .portrait: return 90
+        case .portraitUpsideDown: return 270
+        case .landscapeLeft: return 180
+        case .landscapeRight: return 0
+        case .unknown: return nil
+        @unknown default: return nil
+        }
+    }
+}
