@@ -67,13 +67,16 @@ final class OSBARCCaptureSessionManager: OSBARCCameraManager {
             // Set the input device on the capture session.
             self.captureSession.addInput(deviceInput)
 
-            let deviceOutput = AVCaptureVideoDataOutput()
-            // Set the quality of the video
-            deviceOutput.setSampleBufferDelegate(self.outputDecoder, queue: self.outputDecoder.delegateQueue)
+            let metadataOutput = AVCaptureMetadataOutput()
+            // Deliver metadata objects on the decoder's serial queue.
+            metadataOutput.setMetadataObjectsDelegate(self.outputDecoder, queue: self.outputDecoder.delegateQueue)
 
-            if self.captureSession.canAddOutput(deviceOutput) {
-                // What we will display on the screen
-                self.captureSession.addOutput(deviceOutput)
+            if self.captureSession.canAddOutput(metadataOutput) {
+                // Register the metadata output with the session.
+                self.captureSession.addOutput(metadataOutput)
+
+                // Set the barcode types to detect AFTER adding to the session (required by AVFoundation).
+                metadataOutput.metadataObjectTypes = self.outputDecoder.metadataObjectTypes
 
                 // Initialise the video preview layer and add it as a sublayer to the view's layer.
                 let videoPreviewLayer = AVCaptureVideoPreviewLayer(session: self.captureSession)

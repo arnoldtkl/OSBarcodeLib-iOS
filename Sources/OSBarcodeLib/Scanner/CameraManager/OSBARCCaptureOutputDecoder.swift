@@ -1,24 +1,30 @@
+import AudioToolbox
 import AVFoundation
 import Combine
 import SwiftUI
-import Vision
 
 /// Class responsible for decoding the scanning output (in this case, barcodes).
-final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+/// Uses `AVCaptureMetadataOutput` for native, thread-safe barcode detection.
+/// This avoids the Vision framework's `VNDetectBarcodesRequest` reuse issues that
+/// caused `EXC_BAD_ACCESS` crashes on iOS 17 physical devices.
+final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureMetadataOutputObjectsDelegate {
     /// The object containing the value to return.
     @Binding private var scanResult: OSBARCScanResult
-    /// Indicates if scanning should be done only  after a button click or automatically.
+    /// Indicates if scanning should be done only after a button click or automatically.
     private let scanThroughButton: Bool
     /// Indicates if scanning is enabled (when there's a Scan Button).
     private var scanButtonEnabled: Bool
     /// A hint, to scan a specific format (e.g. only qr code). `Nil` or `unknown` value means it can scan all.
-    private var hint: OSBARCScannerHint?
-    /// Cached EXIF orientation updated on the main thread. Read from the capture queue (serial).
-    private var cachedExifOrientation: CGImagePropertyOrientation = .rightMirrored
-    /// Dedicated serial queue used both as the AVCaptureVideoDataOutput delegate queue and for all
-    /// access to `detectBarcodeRequest`. Owning the queue here guarantees that every read/write of
-    /// the Vision request happens on exactly one thread, eliminating data races.
+    private let hint: OSBARCScannerHint?
+
+    /// Dedicated serial queue for the metadata output delegate.
+    /// All reads and writes to mutable state happen here.
     let delegateQueue = DispatchQueue(label: "com.outsystems.osbarc.captureOutput", qos: .default)
+
+    /// The `AVMetadataObject.ObjectType` values to detect, derived from the hint.
+    var metadataObjectTypes: [AVMetadataObject.ObjectType] {
+        (hint ?? .unknown).avMetadataObjectTypes
+    }
 
     /// The publisher's cancellable instance collector.
     private var cancellables: Set<AnyCancellable> = []
@@ -34,138 +40,40 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
         self.scanThroughButton = scanThroughButton
         self.scanButtonEnabled = scanButtonEnabled
         self.hint = hint
-        // init is called on the main thread (before the capture session starts), so reading
-        // UIApplication here is safe. The capture queue hasn't started yet, so the direct
-        // ivar write races with nothing.
-        self.cachedExifOrientation = Self.exifOrientation(
-            for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
-        )
         super.init()
 
         NotificationCenter.default
-            .publisher(for: .scanFrameChanged)
-            .receive(on: RunLoop.main)  // receive this on the main thread
-            .sink { [weak self] notification in // performed this when `scanFrameChanged` gets triggered (on screen rotation).
-                guard let self else { return }
-                // Compute all UIKit values on the main thread, then dispatch only
-                // the results (value types) to delegateQueue so reads in captureOutput
-                // never race with these writes.
-                let windowScene = UIApplication.firstKeyWindowForConnectedScenes?.windowScene
-                let orientation = windowScene?.interfaceOrientation
-                let regionOfInterest: CGRect? = {
-                    guard let imageRect = notification.object as? CGRect,
-                          let screenBounds = windowScene?.screen.bounds else { return nil }
-                    return VNNormalizedRectForImageRect(imageRect, Int(screenBounds.width), Int(screenBounds.height))
-                }()
-                self.delegateQueue.async { [weak self] in
-                    guard let self else { return }
-                    if let regionOfInterest {
-                        self.detectBarcodeRequest.regionOfInterest = regionOfInterest
-                    }
-                    self.cachedExifOrientation = Self.exifOrientation(for: orientation)
-                }
-            }
-            .store(in: &cancellables)
-
-        NotificationCenter.default
             .publisher(for: .scanButtonSelection)
-            .receive(on: RunLoop.main)  // receive this on the main thread
-            .sink { [weak self] notification in // performed this when `scanButtonSelection` gets triggered.
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in // performed when `scanButtonSelection` gets triggered.
                 guard let enabled = notification.object as? Bool else { return }
-                // Route through delegateQueue so the read in captureOutput never races
-                // with this write.
+                // Route through delegateQueue so captureOutput reads are race-free.
                 self?.delegateQueue.async { [weak self] in
                     self?.scanButtonEnabled = enabled
                 }
             }
             .store(in: &cancellables)
-
-        // Seed the cached orientation immediately so the first frames have a valid value.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let orientation = UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
-            self.delegateQueue.async { [weak self] in
-                self?.cachedExifOrientation = Self.exifOrientation(for: orientation)
-            }
-        }
     }
 
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        // Output should only be processed when scanning is automatically or it has been enabled through the Scan Button.
+    // MARK: - AVCaptureMetadataOutputObjectsDelegate
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        // Called on delegateQueue (the queue passed to setMetadataObjectsDelegate).
         guard !self.scanThroughButton || self.scanButtonEnabled else { return }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let codeObject = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              let payload = codeObject.stringValue else { return }
 
-        var requestOptions: [VNImageOption: Any] = [:]
+        // Extract value types now, before dispatching to main, so we don't hold a
+        // reference to the AVMetadataObject (an ObjC heap object) across threads.
+        let objectType = codeObject.type    // struct – safe to escape
+        // payload is a Swift String (value type copy) – safe to escape
 
-        if let camData = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) {
-            requestOptions = [.cameraIntrinsics: camData]
-        }
-
-        let imageRequestHandler = VNImageRequestHandler(
-            cvPixelBuffer: pixelBuffer, orientation: self.deviceExifOrientation(), options: requestOptions
-        )
-        try? imageRequestHandler.perform([self.detectBarcodeRequest])
-    }
-
-    /// Vision request to perform. It gets initialised only once and when needed.
-    lazy private var detectBarcodeRequest: VNDetectBarcodesRequest = {
-        let barcodeRequest = VNDetectBarcodesRequest(completionHandler: { [weak self] request, error in
-            guard error == nil else { return }
-            self?.processClassification(for: request)
-        })
-        barcodeRequest.symbologies = (self.hint ?? .unknown).toVNBarcodeSymbologies()
-
-        return barcodeRequest
-    }()
-}
-
-// MARK: - Private methods
-private extension OSBARCCaptureOutputDecoder {
-    /// Processes the Vision request to return the desired barcode value.
-    /// - Parameter request: Vision request handler that performs image analysis.
-    func processClassification(for request: VNRequest) {
-        // Extract all needed values HERE on delegateQueue, while we are still inside
-        // VNImageRequestHandler.perform() and Vision owns the results array.
-        // By the time we return from this function, perform() may be called again for the
-        // next frame, which sets request.results = nil before overwriting it — reading
-        // request.results from main thread after that is a dangling-pointer data race.
-        guard let bestResult = request.results?.first as? VNBarcodeObservation,
-              bestResult.confidence > 0.9,
-              let payload = bestResult.payloadStringValue else { return }
-        let symbology = bestResult.symbology   // value type — safe to escape
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
-            let format = OSBARCScannerHint.fromVNBarcodeSymbology(symbology, withHint: self.hint)
+            let format = OSBARCScannerHint.fromAVMetadataObjectType(objectType, withHint: self.hint)
             self.scanResult = OSBARCScanResult(text: payload, format: format)
         }
     }
-
-    /// Projects a rectangle from image coordinates into normalized coordinates.
-    /// The normalized coordinates is the format expected by Vision's Region of Interest.
-    /// More detail on https://developer.apple.com/documentation/vision/vnimagebasedrequest/2877482-regionofinterest.
-    /// - Parameter imageRect: The coordinates to convert
-    /// - Returns: The converted coordinates. If can return `nil` if not able to fetch the screens bounds to base on.
-    func scanRegionOfInterest(for imageRect: CGRect) -> CGRect? {
-        guard let screenBounds = UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.screen.bounds else { return nil }
-        return VNNormalizedRectForImageRect(imageRect, Int(screenBounds.width), Int(screenBounds.height))
-    }
-
-    /// Returns the cached EXIF orientation for the current interface orientation.
-    /// Updated on the main thread via `scanFrameChanged` notifications; safe to call from the capture queue.
-    func deviceExifOrientation() -> CGImagePropertyOrientation {
-        return cachedExifOrientation
-    }
-
-    /// Maps a `UIInterfaceOrientation` to the `CGImagePropertyOrientation` needed by Vision.
-    /// Must only be called from the main thread.
-    private static func exifOrientation(for interfaceOrientation: UIInterfaceOrientation?) -> CGImagePropertyOrientation {
-        switch interfaceOrientation ?? .portrait {
-        case .portrait:             return .rightMirrored
-        case .portraitUpsideDown:   return .leftMirrored
-        case .landscapeLeft:        return .upMirrored   // device top to the right
-        case .landscapeRight:       return .downMirrored // device top to the left
-        @unknown default:           return .rightMirrored
-        }
-    }
 }
+
