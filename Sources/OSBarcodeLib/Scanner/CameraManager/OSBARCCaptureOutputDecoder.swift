@@ -34,6 +34,12 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
         self.scanThroughButton = scanThroughButton
         self.scanButtonEnabled = scanButtonEnabled
         self.hint = hint
+        // init is called on the main thread (before the capture session starts), so reading
+        // UIApplication here is safe. The capture queue hasn't started yet, so the direct
+        // ivar write races with nothing.
+        self.cachedExifOrientation = Self.exifOrientation(
+            for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
+        )
         super.init()
 
         NotificationCenter.default
@@ -41,17 +47,23 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
             .receive(on: RunLoop.main)  // receive this on the main thread
             .sink { [weak self] notification in // performed this when `scanFrameChanged` gets triggered (on screen rotation).
                 guard let self else { return }
-                if let imageRect = notification.object as? CGRect, let regionOfInterest = self.scanRegionOfInterest(for: imageRect) {
-                    // Dispatch to the delegateQueue so the write to detectBarcodeRequest is
-                    // serialised with captureOutput calls — both run on the same queue.
-                    self.delegateQueue.async { [weak self] in
-                        self?.detectBarcodeRequest.regionOfInterest = regionOfInterest
+                // Compute all UIKit values on the main thread, then dispatch only
+                // the results (value types) to delegateQueue so reads in captureOutput
+                // never race with these writes.
+                let windowScene = UIApplication.firstKeyWindowForConnectedScenes?.windowScene
+                let orientation = windowScene?.interfaceOrientation
+                let regionOfInterest: CGRect? = {
+                    guard let imageRect = notification.object as? CGRect,
+                          let screenBounds = windowScene?.screen.bounds else { return nil }
+                    return VNNormalizedRectForImageRect(imageRect, Int(screenBounds.width), Int(screenBounds.height))
+                }()
+                self.delegateQueue.async { [weak self] in
+                    guard let self else { return }
+                    if let regionOfInterest {
+                        self.detectBarcodeRequest.regionOfInterest = regionOfInterest
                     }
+                    self.cachedExifOrientation = Self.exifOrientation(for: orientation)
                 }
-                // Also refresh cached EXIF orientation while we're already on the main thread.
-                self.cachedExifOrientation = Self.exifOrientation(
-                    for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
-                )
             }
             .store(in: &cancellables)
 
@@ -59,7 +71,10 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
             .publisher(for: .scanButtonSelection)
             .receive(on: RunLoop.main)  // receive this on the main thread
             .sink { [weak self] notification in // performed this when `scanButtonSelection` gets triggered.
-                if let enabled = notification.object as? Bool {
+                guard let enabled = notification.object as? Bool else { return }
+                // Route through delegateQueue so the read in captureOutput never races
+                // with this write.
+                self?.delegateQueue.async { [weak self] in
                     self?.scanButtonEnabled = enabled
                 }
             }
@@ -67,9 +82,11 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
 
         // Seed the cached orientation immediately so the first frames have a valid value.
         DispatchQueue.main.async { [weak self] in
-            self?.cachedExifOrientation = Self.exifOrientation(
-                for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
-            )
+            guard let self else { return }
+            let orientation = UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
+            self.delegateQueue.async { [weak self] in
+                self?.cachedExifOrientation = Self.exifOrientation(for: orientation)
+            }
         }
     }
 
@@ -107,13 +124,20 @@ private extension OSBARCCaptureOutputDecoder {
     /// Processes the Vision request to return the desired barcode value.
     /// - Parameter request: Vision request handler that performs image analysis.
     func processClassification(for request: VNRequest) {
+        // Extract all needed values HERE on delegateQueue, while we are still inside
+        // VNImageRequestHandler.perform() and Vision owns the results array.
+        // By the time we return from this function, perform() may be called again for the
+        // next frame, which sets request.results = nil before overwriting it — reading
+        // request.results from main thread after that is a dangling-pointer data race.
+        guard let bestResult = request.results?.first as? VNBarcodeObservation,
+              bestResult.confidence > 0.9,
+              let payload = bestResult.payloadStringValue else { return }
+        let symbology = bestResult.symbology   // value type — safe to escape
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if let bestResult = request.results?.first as? VNBarcodeObservation, bestResult.confidence > 0.9, let payload = bestResult.payloadStringValue {
-                AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
-                let format = OSBARCScannerHint.fromVNBarcodeSymbology(bestResult.symbology, withHint: self.hint)
-                self.scanResult = OSBARCScanResult(text: payload, format: format)
-            }
+            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+            let format = OSBARCScannerHint.fromVNBarcodeSymbology(symbology, withHint: self.hint)
+            self.scanResult = OSBARCScanResult(text: payload, format: format)
         }
     }
 
