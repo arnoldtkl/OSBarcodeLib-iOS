@@ -13,7 +13,9 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
     private var scanButtonEnabled: Bool
     /// A hint, to scan a specific format (e.g. only qr code). `Nil` or `unknown` value means it can scan all.
     private var hint: OSBARCScannerHint?
-    
+    /// Cached EXIF orientation updated on the main thread. Read from the capture queue (serial).
+    private var cachedExifOrientation: CGImagePropertyOrientation = .rightMirrored
+
     /// The publisher's cancellable instance collector.
     private var cancellables: Set<AnyCancellable> = []
     
@@ -33,22 +35,34 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
         NotificationCenter.default
             .publisher(for: .scanFrameChanged)
             .receive(on: RunLoop.main)  // receive this on the main thread
-            .sink { // performed this when `scanFrameChanged` gets triggered (on screen rotation).
-                if let imageRect = $0.object as? CGRect, let regionOfInterest = self.scanRegionOfInterest(for: imageRect) {
+            .sink { [weak self] notification in // performed this when `scanFrameChanged` gets triggered (on screen rotation).
+                guard let self else { return }
+                if let imageRect = notification.object as? CGRect, let regionOfInterest = self.scanRegionOfInterest(for: imageRect) {
                     self.detectBarcodeRequest.regionOfInterest = regionOfInterest   // update `regionOfInterest`
                 }
+                // Also refresh cached EXIF orientation while we're already on the main thread.
+                self.cachedExifOrientation = Self.exifOrientation(
+                    for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
+                )
             }
             .store(in: &cancellables)
         
         NotificationCenter.default
             .publisher(for: .scanButtonSelection)
             .receive(on: RunLoop.main)  // receive this on the main thread
-            .sink { // performed this when `scanButtonSelection` gets triggered.
-                if let enabled = $0.object as? Bool {
-                    self.scanButtonEnabled = enabled
+            .sink { [weak self] notification in // performed this when `scanButtonSelection` gets triggered.
+                if let enabled = notification.object as? Bool {
+                    self?.scanButtonEnabled = enabled
                 }
             }
             .store(in: &cancellables)
+
+        // Seed the cached orientation immediately so the first frames have a valid value.
+        DispatchQueue.main.async { [weak self] in
+            self?.cachedExifOrientation = Self.exifOrientation(
+                for: UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.interfaceOrientation
+            )
+        }
     }
     
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -70,9 +84,9 @@ final class OSBARCCaptureOutputDecoder: NSObject, AVCaptureVideoDataOutputSample
     
     /// Vision request to perform. It gets initialised only once and when needed.
     lazy private var detectBarcodeRequest: VNDetectBarcodesRequest = {
-        let barcodeRequest = VNDetectBarcodesRequest(completionHandler: { request, error in
+        let barcodeRequest = VNDetectBarcodesRequest(completionHandler: { [weak self] request, error in
             guard error == nil else { return }
-            self.processClassification(for: request)
+            self?.processClassification(for: request)
         })
         barcodeRequest.symbologies = (self.hint ?? .unknown).toVNBarcodeSymbologies()
         
@@ -104,22 +118,21 @@ private extension OSBARCCaptureOutputDecoder {
         return VNNormalizedRectForImageRect(imageRect, Int(screenBounds.width), Int(screenBounds.height))
     }
     
-    /// Converts device orientation into the intended image's display orientation.
-    /// - Returns: The equivalent `CGImagePropertyOrientation` to use for the device's current orientation.
+    /// Returns the cached EXIF orientation for the current interface orientation.
+    /// Updated on the main thread via `scanFrameChanged` notifications; safe to call from the capture queue.
     func deviceExifOrientation() -> CGImagePropertyOrientation {
-        switch UIDevice.current.orientation {
-        case .landscapeRight: return .upMirrored
-        case .portraitUpsideDown: return .leftMirrored
-        case .landscapeLeft: return .downMirrored
-        case .portrait: return .rightMirrored
-        default:    // unknown or flat.
-            var screenBounds: CGRect?
-            DispatchQueue.main.sync {   // This needs to be done as `UIApplication` calls need to be done on the main thread.
-                screenBounds = UIApplication.firstKeyWindowForConnectedScenes?.windowScene?.screen.bounds
-            }
-            guard let screenBounds, screenBounds.width > screenBounds.height
-            else { return .rightMirrored }  // assume portrait
-            return .downMirrored    // assume landscapeLeft
+        return cachedExifOrientation
+    }
+
+    /// Maps a `UIInterfaceOrientation` to the `CGImagePropertyOrientation` needed by Vision.
+    /// Must only be called from the main thread.
+    private static func exifOrientation(for interfaceOrientation: UIInterfaceOrientation?) -> CGImagePropertyOrientation {
+        switch interfaceOrientation ?? .portrait {
+        case .portrait:             return .rightMirrored
+        case .portraitUpsideDown:   return .leftMirrored
+        case .landscapeLeft:        return .upMirrored   // device top to the right
+        case .landscapeRight:       return .downMirrored // device top to the left
+        @unknown default:           return .rightMirrored
         }
     }
 }
