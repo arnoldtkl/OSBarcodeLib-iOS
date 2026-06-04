@@ -27,8 +27,6 @@ final class OSBARCCaptureSessionManager: OSBARCCameraManager {
 
     /// Object that coordinates the follow between the input device to the capture output.
     private let captureSession = AVCaptureSession()
-    /// Dedicated serial queue for the sample buffer delegate. Apple requires a serial queue to guarantee ordered delivery.
-    private let captureOutputQueue = DispatchQueue(label: "com.outsystems.osbarc.captureOutput", qos: .default)
 
     /// Constructor method.
     /// - Parameters:
@@ -71,7 +69,7 @@ final class OSBARCCaptureSessionManager: OSBARCCameraManager {
 
             let deviceOutput = AVCaptureVideoDataOutput()
             // Set the quality of the video
-            deviceOutput.setSampleBufferDelegate(self.outputDecoder, queue: self.captureOutputQueue)
+            deviceOutput.setSampleBufferDelegate(self.outputDecoder, queue: self.outputDecoder.delegateQueue)
 
             if self.captureSession.canAddOutput(deviceOutput) {
                 // What we will display on the screen
